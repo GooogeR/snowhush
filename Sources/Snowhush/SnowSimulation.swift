@@ -420,10 +420,26 @@ final class SnowSimulation {
     /// simulated separately from the user's real cursor.
     var snowPlowCursor: SIMD2<Float>? {
         didSet {
-            if snowPlowCursor == nil { snowPlowLastX = nil }
+            if snowPlowCursor == nil {
+                // The plough has left the screen: remove any temporary carried
+                // mound so it can never remain as a wall at the display edge.
+                for item in snowPlowHeap {
+                    let remaining = max(0, ground.heights[item.index] - item.height)
+                    ground.set(item.index, remaining)
+                }
+                snowPlowHeap.removeAll(keepingCapacity: true)
+                snowPlowCargo = Gathered()
+                snowPlowLastX = nil
+                ground.refreshTop()
+            }
         }
     }
     private var snowPlowLastX: Float?
+    /// Snow gathered by the plough and the temporary ground columns used to
+    /// render its moving load. The heap is removed and recreated at the next
+    /// position so it travels with the blade instead of being left behind.
+    private var snowPlowCargo = Gathered()
+    private var snowPlowHeap: [(index: Int, height: Float)] = []
     /// Screen edges with no display past them: a window slid past one leaves its snow heaped against the edge.
     var walls: (left: Bool, right: Bool) = (false, false)
     /// Side edges past which lies a display with snow of its own that windows span onto: snow on a window reaching
@@ -1766,44 +1782,118 @@ final class SnowSimulation {
     /// mass into a compact windrow at its leading edge. This is deliberately independent of the
     /// circular cursor-carving code so the user's pointer keeps its normal behaviour.
     private func pushSnowPlow(to frontX: Float) {
-        let bladeWidth: Float = 46
+        let bladeWidth: Float = 35
         guard let previousFront = snowPlowLastX else {
             snowPlowLastX = frontX
             return
         }
+
         let delta = frontX - previousFront
         snowPlowLastX = frontX
         guard abs(delta) > 0.01 else { return }
 
         let movingRight = delta > 0
+
+        // Remove only the temporary heap created by the previous frame.
+        // The snow collected inside the plough remains in snowPlowCargo.
+        for item in snowPlowHeap {
+            let remaining = max(0, ground.heights[item.index] - item.height)
+            ground.set(item.index, remaining)
+        }
+        snowPlowHeap.removeAll(keepingCapacity: true)
+
+        // Collect the strip that has just passed under the blade's trailing edge.
         let oldTrailing = previousFront - (movingRight ? bladeWidth : 0)
         let newTrailing = frontX - (movingRight ? bladeWidth : 0)
         let lowX = min(oldTrailing, newTrailing)
         let highX = max(oldTrailing, newTrailing)
         let first = max(0, Int(((lowX - ground.base.x) / columnWidth).rounded(.down)))
         let last = min(ground.count - 1, Int(((highX - ground.base.x) / columnWidth).rounded(.down)))
-        guard first <= last else { return }
 
-        var gathered = Gathered()
-        for i in first...last where ground.visible[i] {
-            let height = ground.heights[i]
-            guard height > 0.05 else { continue }
-            gathered.add(height * columnWidth, ground.blend(i))
-            ground.set(i, 0)
-            heightsChanged = true
+        if first <= last {
+            var gathered = Gathered()
+            for i in first...last where ground.visible[i] {
+                let height = ground.heights[i]
+                guard height > 0.05 else { continue }
+                gathered.add(height * columnWidth, ground.blend(i))
+                ground.set(i, 0)
+                heightsChanged = true
+            }
+            if gathered.area > 0.05 {
+                snowPlowCargo.add(gathered.area, gathered.blend)
+                lastCursorPush = clock
+            }
         }
-        guard gathered.area > 0.05 else { return }
 
-        // Preserve the gathered snow: most is heaped ahead of the blade, with a smaller
-        // windrow left along the cleared strip. On the return lane the leading edge flips.
+        guard snowPlowCargo.area > 0.05 else {
+            ground.refreshTop()
+            return
+        }
+
+        // Carry the visible snow heap along with the blade. Rebuilding the
+        // same load at its new position each frame makes it look as if the
+        // snow is sitting in the plough rather than being erased or left behind.
         let leadingX = movingRight ? frontX : frontX - bladeWidth
-        let trailingX = movingRight ? frontX - bladeWidth : frontX
-        let leadingEdge = min(ground.count - 1, max(0, Int(((leadingX - ground.base.x) / columnWidth).rounded(.down))))
-        let trailingEdge = min(ground.count - 1, max(0, Int(((trailingX - ground.base.x) / columnWidth).rounded(.down))))
-        let inward = movingRight ? -1 : 1
-        ground.heap(gathered.area * 0.82, against: leadingEdge, inward: inward, slope: 0.72, blend: gathered.blend)
-        ground.heap(gathered.area * 0.18, against: trailingEdge, inward: inward, slope: 0.9, blend: gathered.blend)
-        lastCursorPush = clock
+        let edge = min(ground.count - 1, max(0,
+            Int(((leadingX - ground.base.x) / columnWidth).rounded(.down))))
+
+        // Use the actual final ground columns as the disposal boundary. The
+        // simulation's view width and the snow layer's coordinate origin can
+        // differ, so comparing raw screen coordinates can miss the edge and
+        // keep stacking the load into the last column.
+        let disposalColumn = max(0, ground.count - 3)
+        if movingRight && edge >= disposalColumn {
+            // The screen edge acts as a one-way snow chute. Feed the carried
+            // mound out in small animated chunks instead of deleting it all
+            // in one frame. Fast horizontal motion takes each chunk offscreen
+            // before gravity can drop it back onto the right edge.
+            if snowPlowCargo.area > 0.05 && grains.count < maxGrains - 2 {
+                let blend = snowPlowCargo.blend
+                // Discharge only a small slice per simulation frame so the
+                // load visibly streams away over time instead of vanishing
+                // in a handful of frames.
+                let amount = min(snowPlowCargo.area, max(0.35, snowPlowCargo.area * 0.025))
+                let leaves = amount * blend.leaves
+                snowPlowCargo.area -= amount
+                snowPlowCargo.leaves = max(0, snowPlowCargo.leaves - leaves)
+                snowPlowCargo.petals = max(0, snowPlowCargo.petals - amount * blend.petals)
+
+                throwLump(
+                    amount,
+                    at: SIMD2(ground.base.x + width - 22, ground.base.y + 8),
+                    velocity: SIMD2(300, -18)
+                )
+            }
+
+            // Remove the narrow strip that has physically crossed the edge;
+            // leave the remaining load visible until its next animated chunk
+            // is carried out.
+            let disposalStart = max(0, ground.count - max(12, ground.count / 8))
+            for i in disposalStart..<ground.count {
+                ground.set(i, 0)
+            }
+
+            if snowPlowCargo.area <= 0.05 {
+                snowPlowCargo = Gathered()
+                snowPlowHeap.removeAll(keepingCapacity: true)
+            }
+            ground.refreshTop()
+            heightsChanged = true
+            return
+        }
+        // Keep the carried mound on the inside of the blade, not spread toward the screen edge.
+        let inward = movingRight ? 1 : -1
+        let before = ground.heights
+        ground.heap(snowPlowCargo.area, against: edge, inward: inward, slope: 0.72, blend: snowPlowCargo.blend)
+
+        // Remember the exact temporary height added by this heap so it can
+        // move on the next frame without disturbing the underlying snow bed.
+        for i in ground.heights.indices {
+            let added = ground.heights[i] - before[i]
+            if added > 0.001 {
+                snowPlowHeap.append((index: i, height: added))
+            }
+        }
         ground.refreshTop()
     }
 
